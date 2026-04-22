@@ -21,8 +21,15 @@ data:
   num_workers_val: 2
   pin_memory: true
   transform: "ImageAugmentation(apply_aug=True, color_jitter={'brightness': 0.5, 'contrast': 0.5, 'saturation': 0.5, 'hue': 0.1, 'p': 0.9}, gray_scale=True, gau_blur=False)"
-  aspect_ratios: [0.5, 2.0]
+  aspect_ratios: [2.0, 2.0]
   num_pixels_range: [100000, 250000]
+  enable_fov_curriculum: true
+  fov_start_deg: 90.0
+  fov_end_deg: 360.0
+  fov_curriculum_total_steps: ${trainer.max_steps}
+  enable_circular_pad_after_fov_unlock: true
+  circular_pad_pixels_after_fov_unlock: 14
+  circular_pad_prob_after_fov_unlock: 0.5
   train_datasets:
     - 400 @ HyperSim_Multi(split='train', num_views=${data.max_images_per_gpu}, aug_crop=0.77, transform=${data.transform}, ROOT='${paths.hypersim_dir}')
   validation_datasets:

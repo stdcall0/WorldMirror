@@ -154,10 +154,31 @@ def log_training_input_and_output_images(
             except:
                 pass
 
+        # Get predicted normals (fallback to Depth2Normal on predicted depth for visualization only).
+        pred_normals = preds.get("normals", None)
+        pred_normal_source = "PredHead"
+        if pred_normals is None and preds.get("depth") is not None:
+            try:
+                pred_depth = preds["depth"]
+                if pred_depth.ndim == 5 and pred_depth.shape[-1] == 1:
+                    pred_depth = pred_depth[..., 0]
+                if pred_depth.ndim == 4 and "camera_intrs" in inputs:
+                    B, S, H, W = pred_depth.shape
+                    depth2normal = Depth2Normal()
+                    pred_valid_mask = (pred_depth > 0) & torch.isfinite(pred_depth)
+                    pred_norm, _ = depth2normal(
+                        pred_depth.reshape(B * S, 1, H, W),
+                        inputs["camera_intrs"].reshape(B * S, 3, 3),
+                        pred_valid_mask.reshape(B * S, 1, H, W),
+                        scale=1.0,
+                    )
+                    pred_normals = pred_norm.reshape(B, S, 3, H, W)
+                    pred_normal_source = "Depth2Normal(PredDepth)"
+            except:
+                pass
+
         # Process normals and depths
-        normals_vis = process_normals_for_vis(
-            preds.get("normals"), num_views, batch_idx
-        )
+        normals_vis = process_normals_for_vis(pred_normals, num_views, batch_idx)
         gt_normals_vis = process_normals_for_vis(gt_normals, num_views, batch_idx)
         depths_vis = process_depths_for_vis(preds.get("depth"), num_views, batch_idx)
         gt_depths_vis = process_depths_for_vis(
@@ -166,6 +187,8 @@ def log_training_input_and_output_images(
 
         # Create placeholders for missing data
         placeholder = torch.zeros((h, w, 3), device=device)
+        if not normals_vis:
+            pred_normal_source = "Unavailable"
         normals_vis = normals_vis or [placeholder] * num_views
         gt_normals_vis = gt_normals_vis or [placeholder] * num_views
         depths_vis = depths_vis or [placeholder] * num_views
@@ -185,7 +208,7 @@ def log_training_input_and_output_images(
         grid_np = to_uint8_img(grid)
         labels = [
             "Input Images",
-            "Pred Normal",
+            f"Pred Normal ({pred_normal_source})",
             f"GT Normal ({gt_normal_source})",
             "Pred Depth",
             "GT Depth",
@@ -420,7 +443,7 @@ def render_video_interpolation_multiview(
         intrinsic_chunk = pred_all_intrinsic[:, start:end]  # (b, chunk, 3, 3)
 
         rendered_colors_chunk, rendered_depths_chunk, _ = (
-            gs_renderer.rasterizer.rasterize_batches(
+            gs_renderer.rasterize_batches(
                 splats["means"][:1],
                 splats["quats"][:1],
                 splats["scales"][:1],

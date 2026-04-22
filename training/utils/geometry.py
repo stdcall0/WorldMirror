@@ -11,6 +11,24 @@ import torch
 import einops
 import numpy as np
 from src.utils.warnings import no_warnings
+from src.models.utils.frustum import calculate_in_frustum_mask as model_calculate_in_frustum_mask
+
+
+def _is_spherical_intrinsics_np(camera_intrinsics: np.ndarray, height: int, width: int, rel_tol: float = 0.05) -> bool:
+    fx = float(camera_intrinsics[0, 0])
+    fy = float(camera_intrinsics[1, 1])
+    if not np.isfinite(fx) or not np.isfinite(fy) or fx <= 1e-6 or fy <= 1e-6:
+        return False
+
+    expected_fx = float(width) / (2.0 * np.pi)
+    expected_fy = float(height) / np.pi
+    tol_fx = max(expected_fx * rel_tol, 1e-6)
+    tol_fy = max(expected_fy * rel_tol, 1e-6)
+
+    full_erp = (abs(fx - expected_fx) <= tol_fx) and (abs(fy - expected_fy) <= tol_fy)
+    # Allow horizontal FoV-cropped ERP intrinsics: fy follows ERP rule while fx can be larger.
+    partial_erp = (abs(fy - expected_fy) <= tol_fy) and (fx >= (expected_fx - tol_fx))
+    return bool(full_erp or partial_erp)
 
 
 def depthmap_to_camera_coordinates(depthmap, camera_intrinsics, pseudo_focal=None):
@@ -37,11 +55,25 @@ def depthmap_to_camera_coordinates(depthmap, camera_intrinsics, pseudo_focal=Non
     cu = camera_intrinsics[0, 2]
     cv = camera_intrinsics[1, 2]
 
-    u, v = np.meshgrid(np.arange(W), np.arange(H))
-    z_cam = depthmap
-    x_cam = (u - cu) * z_cam / fu
-    y_cam = (v - cv) * z_cam / fv
-    X_cam = np.stack((x_cam, y_cam, z_cam), axis=-1).astype(np.float32)
+    u, v = np.meshgrid(
+        np.arange(W, dtype=np.float32),
+        np.arange(H, dtype=np.float32),
+    )
+    z_cam = depthmap.astype(np.float32)
+
+    if _is_spherical_intrinsics_np(camera_intrinsics, H, W):
+        lon = (u + 0.5 - cu) / fu
+        lat = 0.5 * np.pi - (v + 0.5 - cv) / fv
+        cos_lat = np.cos(lat)
+
+        dir_x = cos_lat * np.sin(lon)
+        dir_y = -np.sin(lat)
+        dir_z = cos_lat * np.cos(lon)
+        X_cam = np.stack((dir_x * z_cam, dir_y * z_cam, dir_z * z_cam), axis=-1).astype(np.float32)
+    else:
+        x_cam = (u - cu) * z_cam / fu
+        y_cam = (v - cv) * z_cam / fv
+        X_cam = np.stack((x_cam, y_cam, z_cam), axis=-1).astype(np.float32)
 
     # Mask for valid coordinates
     valid_mask = depthmap > 0.0
@@ -93,69 +125,14 @@ def calculate_unprojected_mask(views, target_views):
 
 @torch.no_grad()
 def calculate_in_frustum_mask(depth_1, intrinsics_1, c2w_1, depth_2, intrinsics_2, c2w_2):
-    """
-    A function that takes in the depth, intrinsics and c2w matrices of two sets
-    of views, and then works out which of the pixels in the first set of views
-    has a direct corresponding pixel in any of views in the second set
-
-    Args:
-        depth_1: (b, v1, h, w)
-        intrinsics_1: (b, v1, 3, 3)
-        c2w_1: (b, v1, 4, 4)
-        depth_2: (b, v2, h, w)
-        intrinsics_2: (b, v2, 3, 3)
-        c2w_2: (b, v2, 4, 4)
-
-    Returns:
-        torch.Tensor: valid mask with shape (b, v1, v2, h, w).
-    """
-
-    _, v1, h, w = depth_1.shape
-    _, v2, _, _ = depth_2.shape
-
-    # Unproject the depth to get the 3D points in world space
-    points_3d = unproject_depth(depth_1[..., None], intrinsics_1, c2w_1)  # (b, v1, h, w, 3)
-
-    # Project the 3D points into the pixel space of all the second views simultaneously
-    camera_points = world_space_to_camera_space(points_3d, c2w_2)  # (b, v1, v2, h, w, 3)
-    points_2d = camera_space_to_pixel_space(camera_points, intrinsics_2)  # (b, v1, v2, h, w, 2)
-
-    # Calculate the depth of each point
-    rendered_depth = camera_points[..., 2]  # (b, v1, v2, h, w)
-
-    # We use three conditions to determine if a point should be masked
-
-    # Condition 1: Check if the points are in the frustum of any of the v2 views
-    in_frustum_mask = (
-        (points_2d[..., 0] > 0) &
-        (points_2d[..., 0] < w) &
-        (points_2d[..., 1] > 0) &
-        (points_2d[..., 1] < h)
-    )  # (b, v1, v2, h, w)
-    in_frustum_mask = in_frustum_mask.any(dim=-3)  # (b, v1, h, w)
-
-    # Condition 2: Check if the points have non-zero (i.e. valid) depth in the input view
-    non_zero_depth = depth_1 > 1e-6
-
-    # Condition 3: Check if the points have matching depth to any of the v2
-    # views torch.nn.functional.grid_sample expects the input coordinates to
-    # be normalized to the range [-1, 1], so we normalize first
-    points_2d[..., 0] /= w
-    points_2d[..., 1] /= h
-    points_2d = points_2d * 2 - 1
-    matching_depth = torch.ones_like(rendered_depth, dtype=torch.bool)
-    for b in range(depth_1.shape[0]):
-        for i in range(v1):
-            for j in range(v2):
-                depth = einops.rearrange(depth_2[b, j], 'h w -> 1 1 h w')
-                coords = einops.rearrange(points_2d[b, i, j], 'h w c -> 1 h w c')
-                sampled_depths = torch.nn.functional.grid_sample(depth, coords, align_corners=False)[0, 0]
-                matching_depth[b, i, j] = torch.isclose(rendered_depth[b, i, j], sampled_depths, atol=1e-1)
-
-    matching_depth = matching_depth.any(dim=-3)  # (..., v1, h, w)
-
-    mask = in_frustum_mask & non_zero_depth & matching_depth
-    return mask
+    return model_calculate_in_frustum_mask(
+        depth_1,
+        intrinsics_1,
+        c2w_1,
+        depth_2,
+        intrinsics_2,
+        c2w_2,
+    )
 
 
 # --- Projections ---

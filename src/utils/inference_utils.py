@@ -5,13 +5,14 @@ from torchvision import transforms
 import glob
 import os
 from src.utils.video_utils import video_to_image_frames
+from src.utils.erp_utils import get_erp_resize_hw, apply_erp_circular_padding
 
 IMAGE_EXTS = ['*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tiff', '*.webp']
 VIDEO_EXTS = ['.mp4', '.avi', '.mov', '.webm', '.gif']
     
 
 
-def load_and_preprocess_images(image_file_paths, preprocessing_mode="crop", output_size=518):
+def load_and_preprocess_images(image_file_paths, preprocessing_mode="erp", output_size=518, circular_pad_pixels=0):
     """
     Transform raw image files into model-ready tensor batches with standardized dimensions.
     
@@ -42,8 +43,8 @@ def load_and_preprocess_images(image_file_paths, preprocessing_mode="crop", outp
     if len(image_file_paths) == 0:
         raise ValueError("At least 1 image is required")
 
-    if preprocessing_mode not in ["crop", "pad"]:
-        raise ValueError("preprocessing_mode must be either 'crop' or 'pad'")
+    if preprocessing_mode not in ["crop", "pad", "erp"]:
+        raise ValueError("preprocessing_mode must be one of: 'crop', 'pad', 'erp'")
 
     processed_image_list = []
     image_dimension_set = set()
@@ -76,6 +77,9 @@ def load_and_preprocess_images(image_file_paths, preprocessing_mode="crop", outp
             else:
                 scaled_height = model_target_size
                 scaled_width = round(original_width * (scaled_height / original_height) / 14) * 14  # Patch compatibility
+        elif preprocessing_mode == "erp":
+            # ERP-only path: use a fixed 2:1 canvas aligned to patch grid.
+            scaled_height, scaled_width = get_erp_resize_hw(model_target_size, patch_size=14, aspect_ratio=2.0)
         else:  # preprocessing_mode == "crop"
             # Width normalization with proportional height adjustment
             scaled_width = model_target_size
@@ -105,6 +109,9 @@ def load_and_preprocess_images(image_file_paths, preprocessing_mode="crop", outp
                 image_tensor = torch.nn.functional.pad(
                     image_tensor, (padding_left, padding_right, padding_top, padding_bottom), mode="constant", value=1.0
                 )
+
+        # Optional wrap-around compensation for ERP boundaries.
+        image_tensor = apply_erp_circular_padding(image_tensor, pad_pixels=int(circular_pad_pixels))
 
         image_dimension_set.add((image_tensor.shape[1], image_tensor.shape[2]))
         processed_image_list.append(image_tensor)
@@ -163,6 +170,8 @@ def _calculate_resize_dims(orig_w, orig_h, max_dim, resize_strategy, patch_size=
         else:
             new_h = max_dim
             new_w = round(orig_w * (new_h / orig_h) / patch_size) * patch_size
+    elif resize_strategy == "erp":
+        new_h, new_w = get_erp_resize_hw(max_dim, patch_size=patch_size, aspect_ratio=2.0)
     else:  # crop strategy
         new_w = max_dim
         new_h = round(orig_h * (new_w / orig_w) / patch_size) * patch_size
@@ -184,7 +193,7 @@ def _apply_padding(tensor_img, target_dim):
     return tensor_img
 
 
-def prepare_images_to_tensor(file_paths, resize_strategy="crop", target_size=518):
+def prepare_images_to_tensor(file_paths, resize_strategy="erp", target_size=518, circular_pad_pixels=0):
     """
     Process image files into uniform tensor batch for model input.
     
@@ -199,8 +208,8 @@ def prepare_images_to_tensor(file_paths, resize_strategy="crop", target_size=518
     if not file_paths:
         raise ValueError("At least 1 image is required")
     
-    if resize_strategy not in ["crop", "pad"]:
-        raise ValueError("Strategy must be 'crop' or 'pad'")
+    if resize_strategy not in ["crop", "pad", "erp"]:
+        raise ValueError("Strategy must be one of: 'crop', 'pad', 'erp'")
     
     tensor_list = []
     dimension_set = set()
@@ -226,6 +235,9 @@ def prepare_images_to_tensor(file_paths, resize_strategy="crop", target_size=518
         # Apply padding for pad strategy
         if resize_strategy == "pad":
             tensor_img = _apply_padding(tensor_img, target_size)
+
+        # Optional wrap-around compensation for ERP boundaries.
+        tensor_img = apply_erp_circular_padding(tensor_img, pad_pixels=int(circular_pad_pixels))
         
         dimension_set.add((tensor_img.shape[1], tensor_img.shape[2]))
         tensor_list.append(tensor_img)
@@ -248,7 +260,7 @@ def prepare_images_to_tensor(file_paths, resize_strategy="crop", target_size=518
     return batch_tensor.unsqueeze(0)
 
 
-def extract_load_and_preprocess_images(image_folder_or_video_path, fps=1, target_size=518, mode="crop"):
+def extract_load_and_preprocess_images(image_folder_or_video_path, fps=1, target_size=518, mode="erp", circular_pad_pixels=0):
     # Support multiple image formats
     if image_folder_or_video_path.is_file() and image_folder_or_video_path.suffix.lower() in VIDEO_EXTS:
         frame_paths = video_to_image_frames(str(image_folder_or_video_path), fps=fps)
@@ -258,5 +270,10 @@ def extract_load_and_preprocess_images(image_folder_or_video_path, fps=1, target
         for ext in IMAGE_EXTS:
             img_paths.extend(glob.glob(os.path.join(str(image_folder_or_video_path), ext)))
         img_paths = sorted(img_paths)
-    images = prepare_images_to_tensor(img_paths, resize_strategy=mode, target_size=target_size)
+    images = prepare_images_to_tensor(
+        img_paths,
+        resize_strategy=mode,
+        target_size=target_size,
+        circular_pad_pixels=circular_pad_pixels,
+    )
     return images

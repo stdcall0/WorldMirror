@@ -98,7 +98,8 @@ class VisualGeometryTransformer(nn.Module):
        
         # Calculate patch start index based on conditioning
         if self.enable_cond:
-            self.patch_start_idx = 1 + num_register_tokens + 1 + 1  # camera + register + pose + rays
+            # Rays/depth are injected at patch level; only pose remains a special token.
+            self.patch_start_idx = 1 + num_register_tokens + 1  # camera + register + pose
         else:
             self.patch_start_idx = 1 + num_register_tokens  # camera + register
 
@@ -195,10 +196,10 @@ class VisualGeometryTransformer(nn.Module):
         
         # Ray direction embedding
         if self.cond_methods[2] == "token":
-            self.ray_embed = nn.Sequential(
-                nn.Linear(4, embed_dim, bias=True),
-                nn.SiLU(),
-                nn.Linear(embed_dim, embed_dim, bias=True)
+            # Keep config compatibility while switching to dense raymap conditioning.
+            self.ray_embed = self._init_patch_embedding_module(
+                "conv+mlp", img_size, patch_size, num_reg_tokens,
+                embed_dim=embed_dim, in_chans=4
             )
         else:
             raise NotImplementedError
@@ -288,9 +289,9 @@ class VisualGeometryTransformer(nn.Module):
         # Process all tokens (optional conditioning)
         if self.enable_cond:
             pose_tokens, depth_tokens, ray_tokens = self._process_conditioning(depth_maps, ray_dirs, poses, b, seq_len, patch_count, embed_dim, images, cond_flags)
-            # Add condition tokens to patch tokens
-            patch_tokens = patch_tokens + depth_tokens
-            all_tokens = torch.cat([cam_tokens, reg_tokens, pose_tokens, ray_tokens, patch_tokens], dim=1) 
+            # Inject dense priors at patch level.
+            patch_tokens = patch_tokens + depth_tokens + ray_tokens
+            all_tokens = torch.cat([cam_tokens, reg_tokens, pose_tokens, patch_tokens], dim=1)
         else:
             all_tokens = torch.cat([cam_tokens, reg_tokens, patch_tokens], dim=1)
         
@@ -363,10 +364,10 @@ class VisualGeometryTransformer(nn.Module):
         # Process ray direction embedding
         use_rays = cond_flags[2] == 1 and ray_dirs is not None
         if use_rays:
-            ray_dirs = ray_dirs.reshape(b*seq_len, -1)
-            ray_tokens = self.ray_embed(ray_dirs).unsqueeze(1)
+            ray_dirs = ray_dirs.reshape(b * seq_len, h, w, 4).permute(0, 3, 1, 2).contiguous()
+            ray_tokens = self.ray_embed(ray_dirs).reshape(b * seq_len, patch_count, embed_dim)
         else:
-            ray_tokens = torch.zeros((b*seq_len, 1, embed_dim), device=images.device, dtype=images.dtype)
+            ray_tokens = torch.zeros((b * seq_len, patch_count, embed_dim), device=images.device, dtype=images.dtype)
         
         return pose_tokens, depth_tokens, ray_tokens
 

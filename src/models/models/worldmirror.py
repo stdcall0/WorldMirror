@@ -10,6 +10,7 @@ from src.models.heads.dense_head import DPTHead
 from src.models.models.rasterization import GaussianSplatRenderer
 from src.models.utils.camera_utils import vector_to_camera_matrices, extrinsics_to_vector
 from src.models.utils.priors import normalize_depth, normalize_poses
+from src.utils.erp_utils import build_erp_raymap_batch, rotate_raymap_to_world
 
 from huggingface_hub import PyTorchModelHubMixin
 
@@ -20,6 +21,11 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                  patch_size=14, 
                  embed_dim=1024, 
                  gs_dim=256, 
+                 camera_model="spherical",
+                 gs_erp_render_mode="auto",
+                 gs_cubemap_face_size=None,
+                 gs_cubemap_face_scale=1.0,
+                 gs_erp_aspect_threshold=1.8,
                  enable_cond=True, 
                  enable_cam=True, 
                  enable_pts=True, 
@@ -38,6 +44,11 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         self.gs_dim = gs_dim
+        self.camera_model = camera_model
+        self.gs_erp_render_mode = gs_erp_render_mode
+        self.gs_cubemap_face_size = gs_cubemap_face_size
+        self.gs_cubemap_face_scale = gs_cubemap_face_scale
+        self.gs_erp_aspect_threshold = gs_erp_aspect_threshold
         self.enable_cam = enable_cam
         self.enable_pts = enable_pts
         self.enable_depth = enable_depth
@@ -72,6 +83,11 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
             "patch_size": self.patch_size,
             "embed_dim": self.embed_dim,
             "gs_dim": self.gs_dim,
+            "camera_model": self.camera_model,
+            "gs_erp_render_mode": self.gs_erp_render_mode,
+            "gs_cubemap_face_size": self.gs_cubemap_face_size,
+            "gs_cubemap_face_scale": self.gs_cubemap_face_scale,
+            "gs_erp_aspect_threshold": self.gs_erp_aspect_threshold,
             "enable_cam": self.enable_cam,
             "enable_pts": self.enable_pts,
             "enable_depth": self.enable_depth,
@@ -88,7 +104,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
         
         # Camera pose prediction head
         if self.enable_cam:
-            self.cam_head = CameraHead(dim_in=2 * dim)
+            self.cam_head = CameraHead(dim_in=2 * dim, camera_model=self.camera_model)
 
         # 3D point prediction head
         if self.enable_pts:
@@ -131,6 +147,11 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                 sh_degree=0,
                 enable_prune=True,
                 voxel_size=0.002,
+                camera_model=self.camera_model,
+                erp_render_mode=self.gs_erp_render_mode,
+                cubemap_face_size=self.gs_cubemap_face_size,
+                cubemap_face_scale=self.gs_cubemap_face_scale,
+                erp_aspect_threshold=self.gs_erp_aspect_threshold,
             )
 
     def forward(self, views: Dict[str, torch.Tensor], cond_flags: List[int]=[0, 0, 0], is_inference=True):
@@ -139,7 +160,7 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
 
         Args:
             views: Input data dictionary
-            cond_flags: Conditioning flags [depth, rays, camera]
+            cond_flags: Conditioning flags [camera_pose, depth, raymap]
 
         Returns:
             dict: Prediction results dictionary
@@ -259,18 +280,28 @@ class WorldMirror(nn.Module, PyTorchModelHubMixin):
                     import pdb; pdb.set_trace()
             depths = normalize_depth(depths)  # Shape: [B, S, H, W]
             
-        # Extract ray directions
-        if 'camera_intrs' in views:
-            intrinsics = views['camera_intrs'][:, :, :3, :3]
-            fx, fy = intrinsics[:, :, 0, 0] / w, intrinsics[:, :, 1, 1] / h
-            cx, cy = intrinsics[:, :, 0, 2] / w, intrinsics[:, :, 1, 2] / h
-            rays = torch.stack([fx, fy, cx, cy], dim=-1)  # Shape: [B, S, 4]
+        # Extract or build dense ERP raymap: [B, S, H, W, 4]
+        if 'raymap_world' in views:
+            rays = views['raymap_world']
+        elif 'raymap' in views:
+            rays = views['raymap']
+            ray_h, ray_w = rays.shape[-3:-1]
+            if ray_h != h or ray_w != w:
+                batch_size, seq_len = rays.shape[:2]
+                rays = rays.permute(0, 1, 4, 2, 3).reshape(batch_size * seq_len, 4, ray_h, ray_w)
+                rays = F.interpolate(rays, size=(h, w), mode='bilinear', align_corners=False)
+                rays = rays.reshape(batch_size, seq_len, 4, h, w).permute(0, 1, 3, 4, 2).contiguous()
+        else:
+            rays = build_erp_raymap_batch(views['img'])
+
+        if 'camera_poses' in views and 'raymap_world' not in views:
+            rays = rotate_raymap_to_world(rays, views['camera_poses'])
 
         return (depths, rays, poses)
     
     def transform_camera_vector(self, camera_params, h, w):
         ext_mat, int_mat = vector_to_camera_matrices(
-            camera_params, image_hw=(h, w)
+            camera_params, image_hw=(h, w), camera_model=self.camera_model
         )
         # Create homogeneous transformation matrix
         homo_row = torch.tensor([0, 0, 0, 1], device=ext_mat.device).view(1, 1, 1, 4)

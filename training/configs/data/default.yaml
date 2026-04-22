@@ -3,7 +3,14 @@ max_images_per_gpu: 24
 min_num_of_views: 2
 num_workers: 4
 pin_memory: True
-aspect_ratios: [0.5, 2.0]
+aspect_ratios: [2.0, 2.0]
 num_pixels_range: [100000, 250000]
+enable_fov_curriculum: false
+fov_start_deg: 90.0
+fov_end_deg: 360.0
+fov_curriculum_total_steps: null
+enable_circular_pad_after_fov_unlock: false
+circular_pad_pixels_after_fov_unlock: 0
+circular_pad_prob_after_fov_unlock: 0.5
 train_datasets: null
 validation_datasets: null

@@ -401,19 +401,24 @@ class WorldMirrorWrapper(LightningModule):
         preds_all = {}
         preds_all["nocond"] = self.forward(batched_inputs, cond_flags=[0, 0, 0])
         if self.enable_cond:
-            if "camera_poses" in batched_inputs:
+            has_camera = "camera_poses" in batched_inputs
+            has_depth = "depthmap" in batched_inputs
+
+            if has_camera:
                 preds_all["wcam"] = self.forward(batched_inputs, cond_flags=[1, 0, 0])
-            if "depthmap" in batched_inputs:
+            if has_depth:
                 preds_all["wdepth"] = self.forward(batched_inputs, cond_flags=[0, 1, 0])
-            if "camera_intrs" in batched_inputs:
-                preds_all["wintrs"] = self.forward(batched_inputs, cond_flags=[0, 0, 1])
-            if "camera_poses" in batched_inputs and "camera_intrs" in batched_inputs:
-                if "depthmap" in batched_inputs:
+
+            # Third condition flag is dense raymap conditioning, independent of explicit intrinsics keys.
+            preds_all["wray"] = self.forward(batched_inputs, cond_flags=[0, 0, 1])
+
+            if has_camera:
+                if has_depth:
                     preds_all["wall"] = self.forward(
                         batched_inputs, cond_flags=[1, 1, 1]
                     )
                 else:
-                    preds_all["wcam_wpose"] = self.forward(
+                    preds_all["wcam_wray"] = self.forward(
                         batched_inputs, cond_flags=[1, 0, 1]
                     )
 

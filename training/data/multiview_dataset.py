@@ -257,6 +257,169 @@ class MultiViewDataset(BaseDataset):
         """Abstract method to be implemented by subclasses for retrieving view data."""
         raise NotImplementedError()
 
+    @staticmethod
+    def _circular_crop_width(data, start_x, crop_w):
+        """Circularly crop width dimension for HxW(*) arrays/tensors."""
+        if isinstance(data, np.ndarray):
+            width = data.shape[1]
+            crop_idx = (np.arange(start_x, start_x + crop_w) % width).astype(np.int64)
+            if data.ndim == 2:
+                return data[:, crop_idx]
+            return data[:, crop_idx, ...]
+
+        if isinstance(data, torch.Tensor):
+            width = data.shape[1]
+            crop_idx = torch.arange(start_x, start_x + crop_w, device=data.device) % width
+            return data.index_select(1, crop_idx)
+
+        return data
+
+    @staticmethod
+    def _circular_pad_width(data, pad_pixels):
+        """Circularly pad width dimension for HxW(*) arrays/tensors."""
+        if pad_pixels <= 0:
+            return data
+
+        if isinstance(data, np.ndarray):
+            width = data.shape[1]
+            if width <= 0:
+                return data
+            pad = int(min(pad_pixels, width))
+            if pad <= 0:
+                return data
+            left = data[:, -pad:, ...]
+            right = data[:, :pad, ...]
+            return np.concatenate([left, data, right], axis=1)
+
+        if isinstance(data, torch.Tensor):
+            width = data.shape[1]
+            if width <= 0:
+                return data
+            pad = int(min(pad_pixels, width))
+            if pad <= 0:
+                return data
+            left = data[:, -pad:, ...]
+            right = data[:, :pad, ...]
+            return torch.cat([left, data, right], dim=1)
+
+        return data
+
+    def _apply_erp_fov_curriculum_to_view(self, view, target_fov_deg, rng):
+        """Apply ERP FoV crop for views explicitly marked as ERP samples."""
+        if target_fov_deg is None:
+            return view
+
+        img = view.get("img")
+        if img is None:
+            return view
+
+        if isinstance(img, PIL.Image.Image):
+            img_np = np.asarray(img)
+            img_was_pil = True
+        elif isinstance(img, np.ndarray):
+            img_np = img
+            img_was_pil = False
+        else:
+            return view
+
+        height, width = img_np.shape[:2]
+        is_erp_view = bool(view.get("is_erp", False) or view.get("erp_curriculum", False))
+        if not is_erp_view:
+            # ERP images are typically close to 2:1 aspect ratio; use this as fallback.
+            is_erp_view = width >= int(1.8 * height)
+        if not is_erp_view:
+            return view
+
+        fov_deg = float(np.clip(target_fov_deg, 1.0, 360.0))
+        crop_w = int(round(width * fov_deg / 360.0))
+        crop_w = max(self.patch_size, min(width, crop_w))
+        crop_w = max(self.patch_size, (crop_w // self.patch_size) * self.patch_size)
+        crop_w = min(width, crop_w)
+
+        if crop_w < width:
+            start_x = int(rng.integers(0, width))
+            cropped_img = self._circular_crop_width(img_np, start_x, crop_w)
+            view["img"] = PIL.Image.fromarray(cropped_img) if img_was_pil else cropped_img
+
+            # Keep additional ERP-aligned maps in sync with image crop.
+            for key in ["depthmap", "normalmap", "valid_mask", "sky_mask", "raymap"]:
+                if key in view and view[key] is not None:
+                    data = view[key]
+                    if hasattr(data, "shape") and len(data.shape) >= 2:
+                        if data.shape[0] == height and data.shape[1] == width:
+                            view[key] = self._circular_crop_width(data, start_x, crop_w)
+
+            # Keep pseudo intrinsics consistent with wrapped crop coordinates.
+            if "camera_intrs" in view and view["camera_intrs"] is not None:
+                intr = np.array(view["camera_intrs"], dtype=np.float32, copy=True)
+                if intr.shape[-2:] == (3, 3):
+                    intr[0, 2] = (float(intr[0, 2]) - float(start_x)) % float(width)
+                    view["camera_intrs"] = intr
+        else:
+            start_x = 0
+
+        view["erp_fov_deg"] = fov_deg
+        view["erp_fov_start_x"] = start_x
+        view["erp_fov_width"] = crop_w
+
+        return view
+
+    def _apply_erp_circular_padding_to_view(self, view, pad_pixels):
+        """Apply ERP circular padding augmentation and keep view metadata aligned."""
+        if pad_pixels is None or int(pad_pixels) <= 0:
+            return view
+
+        img = view.get("img")
+        if img is None:
+            return view
+
+        if isinstance(img, PIL.Image.Image):
+            img_np = np.asarray(img)
+            img_was_pil = True
+        elif isinstance(img, np.ndarray):
+            img_np = img
+            img_was_pil = False
+        else:
+            return view
+
+        height, width = img_np.shape[:2]
+        is_erp_view = bool(view.get("is_erp", False) or view.get("erp_curriculum", False))
+        if not is_erp_view:
+            is_erp_view = width >= int(1.8 * height)
+        if not is_erp_view:
+            return view
+
+        pad = int(min(max(0, int(pad_pixels)), width))
+        if pad <= 0:
+            return view
+
+        padded_img = self._circular_pad_width(img_np, pad)
+        view["img"] = PIL.Image.fromarray(padded_img) if img_was_pil else padded_img
+
+        # Keep ERP-aligned maps synchronized with image width.
+        for key in ["depthmap", "normalmap", "valid_mask", "sky_mask", "raymap"]:
+            if key in view and view[key] is not None:
+                data = view[key]
+                if hasattr(data, "shape") and len(data.shape) >= 2:
+                    if data.shape[0] == height and data.shape[1] == width:
+                        padded_data = self._circular_pad_width(data, pad)
+                        if key == "depthmap" and isinstance(padded_data, np.ndarray):
+                            padded_data[:, :pad] = 0
+                            padded_data[:, -pad:] = 0
+                        if key == "valid_mask":
+                            padded_data[:, :pad] = False
+                            padded_data[:, -pad:] = False
+                        view[key] = padded_data
+
+        if "camera_intrs" in view and view["camera_intrs"] is not None:
+            intr = np.array(view["camera_intrs"], dtype=np.float32, copy=True)
+            if intr.shape[-2:] == (3, 3):
+                intr[0, 2] = float(intr[0, 2]) + float(pad)
+                view["camera_intrs"] = intr
+
+        view["erp_circular_pad_pixels"] = pad
+        return view
+
     def __getitem__(self, idx):
         """Retrieve and process a batch of multi-view data with optional augmentation and normalization.
         
@@ -271,12 +434,22 @@ class MultiViewDataset(BaseDataset):
         """
         if isinstance(idx, (tuple, list, np.ndarray)):
             idx, aspect_ratio, tuple_views, npixels = idx
-            nview, nview_source = tuple_views
+            if len(tuple_views) >= 4:
+                nview, nview_source, target_fov_deg, target_circular_pad_pixels = tuple_views
+            elif len(tuple_views) >= 3:
+                nview, nview_source, target_fov_deg = tuple_views
+                target_circular_pad_pixels = 0
+            else:
+                nview, nview_source = tuple_views
+                target_fov_deg = None
+                target_circular_pad_pixels = 0
         else:
             aspect_ratio = 1.0
             nview = self.num_views
             nview_source = max(nview - 1, 1) if nview is not None else None
             npixels = None
+            target_fov_deg = None
+            target_circular_pad_pixels = 0
         if nview is not None:
             assert nview >= 1 and nview <= self.num_views
 
@@ -290,6 +463,11 @@ class MultiViewDataset(BaseDataset):
         resolution = compute_adjusted_resolution(self._resolution, aspect_ratio, self.patch_size, npixels)
         views = self._fetch_views(idx, resolution, self._rng, nview)
 
+        if target_fov_deg is not None:
+            views = [self._apply_erp_fov_curriculum_to_view(view, target_fov_deg, self._rng) for view in views]
+        if target_circular_pad_pixels is not None and int(target_circular_pad_pixels) > 0:
+            views = [self._apply_erp_circular_padding_to_view(view, int(target_circular_pad_pixels)) for view in views]
+
         if self.seq_aug_crop:
             delta_target_ratio = self._rng.random() * (1. / self.aug_crop - 1.)
             self.delta_target_resolution = (np.array(resolution) * delta_target_ratio).astype("int")
@@ -301,21 +479,31 @@ class MultiViewDataset(BaseDataset):
 
         for v, view in enumerate(views):
             view["img"] = ToTensor(view["img"])
-            if "depthmap" in view.keys() and "camera_intrs" in view.keys() and "camera_poses" in view.keys():
+            has_depth = ("depthmap" in view and view.get("depthmap") is not None)
+            has_intrs = ("camera_intrs" in view and view.get("camera_intrs") is not None)
+            has_poses = ("camera_poses" in view and view.get("camera_poses") is not None)
+            if has_depth and has_intrs and has_poses:
                 assert np.isfinite(view["depthmap"]).all(), f"NaN in depthmap for view {construct_view_identifier(view)}"
                 pts3d, valid_mask = depthmap_to_absolute_camera_coordinates(**view)
                 view["valid_mask"] = valid_mask & np.isfinite(pts3d).all(axis=-1)
+                pad_pixels = int(view.get("erp_circular_pad_pixels", 0))
+                if pad_pixels > 0 and view["valid_mask"].shape[1] > 2 * pad_pixels:
+                    view["valid_mask"][:, :pad_pixels] = False
+                    view["valid_mask"][:, -pad_pixels:] = False
 
         if nvs_sample:
             context_views, target_views = self.viewsampler.sample_views(views, nview_source)
             views = context_views + target_views
         
-        first_view_camera_pose = views[0]["camera_poses"] if "camera_poses" in views[0] else np.eye(4, dtype=np.float32)
+        first_view_camera_pose = views[0]["camera_poses"] if views[0].get("camera_poses") is not None else np.eye(4, dtype=np.float32)
         for v, view in enumerate(views):
-            if cam_align and "camera_poses" in view:
+            if cam_align and view.get("camera_poses") is not None:
                 view["camera_poses"] = np.linalg.inv(first_view_camera_pose) @ view["camera_poses"]
 
-            if "depthmap" in view.keys() and "camera_intrs" in view.keys() and "camera_poses" in view.keys():
+            has_depth = ("depthmap" in view and view.get("depthmap") is not None)
+            has_intrs = ("camera_intrs" in view and view.get("camera_intrs") is not None)
+            has_poses = ("camera_poses" in view and view.get("camera_poses") is not None)
+            if has_depth and has_intrs and has_poses:
                 pts3d, _ = depthmap_to_absolute_camera_coordinates(**view)
                 view["pts3d"] = pts3d
 
@@ -437,7 +625,7 @@ def validate_data_type(key, v):
     Returns:
         Tuple of (is_valid_bool, error_message_or_none)
     """
-    if isinstance(v, (str, int, tuple)):
+    if isinstance(v, (str, int, float, bool, tuple, np.floating, np.integer)):
         return True, None
     if v.dtype not in (np.float32, torch.float32, bool, np.int32, np.int64, np.uint8):
         return False, f"bad {v.dtype=}"

@@ -2,6 +2,21 @@ import einops
 import torch
 
 
+def _is_spherical_intrinsics(intrinsics: torch.Tensor, height: int, width: int, rel_tol: float = 0.05) -> torch.Tensor:
+    fx = intrinsics[..., 0, 0]
+    fy = intrinsics[..., 1, 1]
+    expected_fx = float(width) / (2.0 * torch.pi)
+    expected_fy = float(height) / torch.pi
+    tol_fx = max(expected_fx * rel_tol, 1e-6)
+    tol_fy = max(expected_fy * rel_tol, 1e-6)
+
+    full_erp = ((fx - expected_fx).abs() <= tol_fx) & ((fy - expected_fy).abs() <= tol_fy)
+    # Allow horizontal FoV-cropped ERP intrinsics: fy follows ERP rule while fx can be larger.
+    partial_erp = ((fy - expected_fy).abs() <= tol_fy) & (fx >= (expected_fx - tol_fx))
+    valid = torch.isfinite(fx) & torch.isfinite(fy) & (fx > 1e-6) & (fy > 1e-6)
+    return valid & (full_erp | partial_erp)
+
+
 # Calculate the loss mask for the target views in the batch
 @torch.no_grad()
 def calculate_unprojected_mask(views, context_nums):
@@ -51,8 +66,8 @@ def calculate_in_frustum_mask(depth_1, intrinsics_1, c2w_1, depth_2, intrinsics_
     camera_points = world_space_to_camera_space(points_3d, c2w_2)  # (b, v1, v2, h, w, 3)
     points_2d = camera_space_to_pixel_space(camera_points, intrinsics_2)  # (b, v1, v2, h, w, 2)
 
-    # Calculate the depth of each point
-    rendered_depth = camera_points[..., 2]  # (b, v1, v2, h, w)
+    # Calculate depth according to the projection model of target views.
+    rendered_depth = camera_space_to_depth(camera_points, intrinsics_2, h, w)  # (b, v1, v2, h, w)
 
     # We use three conditions to determine if a point should be masked
 
@@ -111,10 +126,39 @@ def pixel_space_to_camera_space(pixel_space_points, depth, intrinsics):
     Returns:
         torch.Tensor: Camera space points with shape (b, v, h, w, 3).
     """
-    pixel_space_points = homogenize_points(pixel_space_points)
-    camera_space_points = torch.einsum('b v i j , h w j -> b v h w i', intrinsics.inverse(), pixel_space_points)
-    camera_space_points = camera_space_points * depth
-    return camera_space_points
+    h, w = depth.shape[-3], depth.shape[-2]
+    is_spherical = _is_spherical_intrinsics(intrinsics, h, w)
+
+    # Pinhole path.
+    pixel_space_points_h = homogenize_points(pixel_space_points)
+    pinhole_points = torch.einsum('b v i j , h w j -> b v h w i', intrinsics.inverse(), pixel_space_points_h)
+    pinhole_points = pinhole_points * depth
+
+    if bool((~is_spherical).all()):
+        return pinhole_points
+
+    # ERP spherical path (depth is interpreted as ray distance).
+    u = pixel_space_points[..., 0]
+    v = pixel_space_points[..., 1]
+    fx = intrinsics[..., 0, 0][..., None, None]
+    fy = intrinsics[..., 1, 1][..., None, None]
+    cx = intrinsics[..., 0, 2][..., None, None]
+    cy = intrinsics[..., 1, 2][..., None, None]
+
+    lon = (u + 0.5 - cx) / fx
+    lat = 0.5 * torch.pi - (v + 0.5 - cy) / fy
+    cos_lat = torch.cos(lat)
+    dir_x = cos_lat * torch.sin(lon)
+    dir_y = -torch.sin(lat)
+    dir_z = cos_lat * torch.cos(lon)
+    spherical_dirs = torch.stack([dir_x, dir_y, dir_z], dim=-1)
+    spherical_points = spherical_dirs * depth
+
+    if bool(is_spherical.all()):
+        return spherical_points
+
+    spherical_mask = is_spherical[..., None, None, None]
+    return torch.where(spherical_mask, spherical_points, pinhole_points)
 
 
 def camera_space_to_world_space(camera_space_points, c2w):
@@ -144,9 +188,54 @@ def camera_space_to_pixel_space(camera_space_points, intrinsics):
     Returns:
         torch.Tensor: World space points with shape (b, v1, v2, h, w, 2).
     """
-    camera_space_points = normalize_homogenous_points(camera_space_points)
-    pixel_space_points = torch.einsum('b u i j , b v u h w j -> b v u h w i', intrinsics, camera_space_points)
-    return pixel_space_points[..., :2]
+    h, w = camera_space_points.shape[-3], camera_space_points.shape[-2]
+    is_spherical = _is_spherical_intrinsics(intrinsics, h, w)
+
+    # Pinhole path.
+    camera_points_norm = normalize_homogenous_points(camera_space_points)
+    pinhole_pixels = torch.einsum('b u i j , b v u h w j -> b v u h w i', intrinsics, camera_points_norm)[..., :2]
+
+    if bool((~is_spherical).all()):
+        return pinhole_pixels
+
+    # ERP spherical path.
+    x = camera_space_points[..., 0]
+    y = camera_space_points[..., 1]
+    z = camera_space_points[..., 2]
+    radius = torch.linalg.vector_norm(camera_space_points, dim=-1).clamp_min(1e-6)
+
+    lon = torch.atan2(x, z)
+    lat = torch.asin((-y / radius).clamp(-1.0 + 1e-6, 1.0 - 1e-6))
+
+    fx = intrinsics[:, None, :, 0, 0][:, :, :, None, None]
+    fy = intrinsics[:, None, :, 1, 1][:, :, :, None, None]
+    cx = intrinsics[:, None, :, 0, 2][:, :, :, None, None]
+    cy = intrinsics[:, None, :, 1, 2][:, :, :, None, None]
+
+    u = lon * fx + cx - 0.5
+    v = (0.5 * torch.pi - lat) * fy + cy - 0.5
+    spherical_pixels = torch.stack([u, v], dim=-1)
+
+    if bool(is_spherical.all()):
+        return spherical_pixels
+
+    spherical_mask = is_spherical[:, None, :, None, None, None]
+    return torch.where(spherical_mask, spherical_pixels, pinhole_pixels)
+
+
+def camera_space_to_depth(camera_space_points, intrinsics, height: int, width: int):
+    """Return depth value in the same convention as the camera projection model."""
+    is_spherical = _is_spherical_intrinsics(intrinsics, height, width)
+    z_depth = camera_space_points[..., 2]
+    if bool((~is_spherical).all()):
+        return z_depth
+
+    ray_depth = torch.linalg.vector_norm(camera_space_points, dim=-1)
+    if bool(is_spherical.all()):
+        return ray_depth
+
+    spherical_mask = is_spherical[:, None, :, None, None]
+    return torch.where(spherical_mask, ray_depth, z_depth)
 
 
 def world_space_to_camera_space(world_space_points, c2w):

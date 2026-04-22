@@ -111,7 +111,7 @@ def run_model(
     print("Loading images...")
     image_folder_path = os.path.join(target_dir, "images")
     image_file_paths = [os.path.join(image_folder_path, path) for path in os.listdir(image_folder_path)]
-    img = load_and_preprocess_images(image_file_paths).to(device)
+    img = load_and_preprocess_images(image_file_paths, preprocessing_mode="erp").to(device)
 
     print(f"Loaded {img.shape[1]} images")
     if img.shape[1] == 0:
@@ -127,7 +127,12 @@ def run_model(
     else:
         amp_dtype = torch.float32
     with torch.amp.autocast('cuda', enabled=bool(use_amp), dtype=amp_dtype):
-        predictions = model(inputs)
+        first_pass = model(inputs, cond_flags=[0, 0, 1])
+        if "camera_poses" in first_pass:
+            inputs["camera_poses"] = first_pass["camera_poses"].detach()
+            predictions = model(inputs, cond_flags=[1, 0, 1])
+        else:
+            predictions = first_pass
 
     # img
     imgs = inputs["img"].permute(0, 1, 3, 4, 2)
@@ -1477,7 +1482,7 @@ with gr.Blocks(
             # Load image data using WorldMirror's load_images function
             images_directory = os.path.join(workspace_dir, "images")
             image_file_paths = [os.path.join(images_directory, path) for path in os.listdir(images_directory)]
-            img = load_and_preprocess_images(image_file_paths)
+            img = load_and_preprocess_images(image_file_paths, preprocessing_mode="erp")
             img = img.detach().cpu().numpy()
 
             # Regenerate processed data with new filter settings

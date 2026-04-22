@@ -1,7 +1,9 @@
+import math
 from typing import Dict, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch import Tensor
 from einops import rearrange
 
@@ -38,6 +40,7 @@ class Rasterizer:
         height: int,
         **kwargs,
     ) -> Tuple[Tensor, Tensor, Dict]:
+        camera_model = kwargs.pop("camera_model", self.camera_model)
         render_colors, render_alphas, _ = rasterization(
             means=means,
             quats=quats,
@@ -57,7 +60,7 @@ class Rasterizer:
             sparse_grad=self.sparse_grad,
             rasterize_mode=self.rasterization_mode,
             distributed=self.distributed,
-            camera_model=self.camera_model,
+            camera_model=camera_model,
             render_mode="RGB+ED",
             **kwargs,
         )
@@ -104,6 +107,11 @@ class GaussianSplatRenderer(nn.Module):
         enable_conf_filter: bool = False,  # Enable confidence filtering
         conf_threshold_percent: float = 30.0,  # Confidence threshold percentage
         max_gaussians: int = 5000000,  # Maximum number of Gaussians
+        camera_model: str = "pinhole",
+        erp_render_mode: str = "auto",  # one of: direct, cubemap, auto
+        cubemap_face_size: int | None = None,
+        cubemap_face_scale: float = 1.0,
+        erp_aspect_threshold: float = 1.8,
     ):
         super().__init__()
 
@@ -115,6 +123,12 @@ class GaussianSplatRenderer(nn.Module):
         self.enable_conf_filter = enable_conf_filter
         self.conf_threshold_percent = conf_threshold_percent
         self.max_gaussians = max_gaussians
+        self.camera_model = str(camera_model).lower()
+        self.erp_render_mode = erp_render_mode
+        self.cubemap_face_size = cubemap_face_size
+        self.cubemap_face_scale = cubemap_face_scale
+        self.erp_aspect_threshold = erp_aspect_threshold
+        self._erp_grid_cache = {}
 
         # Predict Gaussian parameters from GS features (quaternions/scales/opacities/SH/weights)
         splits_and_inits = [
@@ -140,7 +154,227 @@ class GaussianSplatRenderer(nn.Module):
             start_channels += out_channel
 
         # Rasterizer
-        self.rasterizer = Rasterizer()
+        self.rasterizer = Rasterizer(camera_model=self.camera_model)
+
+    @staticmethod
+    def _cubemap_face_rotations(device, dtype):
+        # OpenCV-like camera axes: x right, y down, z forward.
+        # Each face rotation maps face-camera coordinates into the base camera frame.
+        data = torch.tensor(
+            [
+                # +X (right)
+                [0.0, 0.0, 1.0, 0.0, 1.0, 0.0, -1.0, 0.0, 0.0],
+                # -X (left)
+                [0.0, 0.0, -1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0],
+                # +Y (down)
+                [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, -1.0, 0.0],
+                # -Y (up)
+                [1.0, 0.0, 0.0, 0.0, 0.0, -1.0, 0.0, 1.0, 0.0],
+                # +Z (front)
+                [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                # -Z (back)
+                [-1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, -1.0],
+            ],
+            device=device,
+            dtype=dtype,
+        )
+        return data.view(6, 3, 3)
+
+    @staticmethod
+    def _is_erp_like_intrinsics(Ks: torch.Tensor, height: int, width: int, rel_tol: float = 0.08) -> bool | None:
+        if Ks is None or Ks.numel() == 0:
+            return None
+
+        fx = Ks[..., 0, 0]
+        fy = Ks[..., 1, 1]
+        expected_fx = float(width) / (2.0 * math.pi)
+        expected_fy = float(height) / math.pi
+
+        tol_fx = max(expected_fx * rel_tol, 1e-6)
+        tol_fy = max(expected_fy * rel_tol, 1e-6)
+        full_erp = ((fx - expected_fx).abs() <= tol_fx) & ((fy - expected_fy).abs() <= tol_fy)
+        partial_erp = ((fy - expected_fy).abs() <= tol_fy) & (fx >= (expected_fx - tol_fx))
+        erp_like = torch.isfinite(fx) & torch.isfinite(fy) & (fx > 1e-6) & (fy > 1e-6)
+        erp_like = erp_like & (full_erp | partial_erp)
+        return bool(erp_like.all())
+
+    def _should_use_erp_cubemap(self, height: int, width: int, Ks: torch.Tensor | None = None) -> bool:
+        mode = str(self.erp_render_mode).lower()
+        if mode == "direct":
+            return False
+        if mode == "cubemap":
+            return True
+        if mode == "auto":
+            if self.camera_model in {"spherical", "erp"}:
+                return True
+            intrinsics_hint = self._is_erp_like_intrinsics(Ks, height, width)
+            if intrinsics_hint is not None:
+                return intrinsics_hint
+            return width >= int(self.erp_aspect_threshold * height)
+        return False
+
+    def _get_face_size(self, height: int) -> int:
+        if self.cubemap_face_size is not None and int(self.cubemap_face_size) > 0:
+            return int(self.cubemap_face_size)
+        return max(16, int(round(float(height) * float(self.cubemap_face_scale))))
+
+    def _build_cubemap_cameras(self, viewmats: torch.Tensor, face_size: int):
+        # viewmats: [B, V, 4, 4] as camera-to-world matrices.
+        B, V = viewmats.shape[:2]
+        device, dtype = viewmats.device, viewmats.dtype
+
+        face_rots = self._cubemap_face_rotations(device, dtype)
+        face_tf = torch.eye(4, device=device, dtype=dtype).view(1, 1, 1, 4, 4).repeat(B, V, 6, 1, 1)
+        face_tf[..., :3, :3] = face_rots.view(1, 1, 6, 3, 3)
+
+        face_viewmats = torch.matmul(viewmats.unsqueeze(2), face_tf).reshape(B, V * 6, 4, 4)
+
+        fx_fy = float(face_size) * 0.5
+        cxy = (float(face_size) - 1.0) * 0.5
+        K = torch.zeros((3, 3), device=device, dtype=dtype)
+        K[0, 0] = fx_fy
+        K[1, 1] = fx_fy
+        K[0, 2] = cxy
+        K[1, 2] = cxy
+        K[2, 2] = 1.0
+        face_Ks = K.view(1, 1, 1, 3, 3).repeat(B, V, 6, 1, 1).reshape(B, V * 6, 3, 3)
+        return face_viewmats, face_Ks
+
+    def _get_erp_reprojection_cache(self, height: int, width: int, device, dtype):
+        key = (height, width, str(device), str(dtype))
+        if key in self._erp_grid_cache:
+            return self._erp_grid_cache[key]
+
+        ys = (torch.arange(height, device=device, dtype=dtype) + 0.5) / float(height)
+        xs = (torch.arange(width, device=device, dtype=dtype) + 0.5) / float(width)
+        lat = 0.5 * math.pi - ys * math.pi
+        lon = xs * (2.0 * math.pi) - math.pi
+        lat_grid, lon_grid = torch.meshgrid(lat, lon, indexing="ij")
+
+        dirs = torch.stack(
+            [
+                torch.cos(lat_grid) * torch.sin(lon_grid),
+                -torch.sin(lat_grid),
+                torch.cos(lat_grid) * torch.cos(lon_grid),
+            ],
+            dim=-1,
+        )  # [H, W, 3]
+
+        face_rots = self._cubemap_face_rotations(device, dtype)
+        face_rots_t = face_rots.transpose(-1, -2)
+        dirs_face = torch.einsum("fij,hwj->fhwi", face_rots_t, dirs)
+
+        z = dirs_face[..., 2].clamp_min(1e-6)
+        u = (dirs_face[..., 0] / z).clamp(-1.0, 1.0)
+        v = (dirs_face[..., 1] / z).clamp(-1.0, 1.0)
+        grids = torch.stack([u, v], dim=-1)  # [6, H, W, 2]
+
+        face_idx = dirs_face[..., 2].argmax(dim=0)  # [H, W]
+        masks = torch.nn.functional.one_hot(face_idx, num_classes=6).permute(2, 0, 1).to(dtype)  # [6,H,W]
+
+        self._erp_grid_cache[key] = (grids, masks)
+        return grids, masks
+
+    def _cubemap_faces_to_erp(self, face_values: torch.Tensor, out_h: int, out_w: int) -> torch.Tensor:
+        # face_values: [B, V, 6, Hf, Wf, C] -> [B, V, out_h, out_w, C]
+        B, V, _, _, _, C = face_values.shape
+        device, dtype = face_values.device, face_values.dtype
+        grids, masks = self._get_erp_reprojection_cache(out_h, out_w, device, dtype)
+
+        face_values = face_values.permute(0, 1, 2, 5, 3, 4).reshape(B * V, 6, C, face_values.shape[3], face_values.shape[4])
+        out = torch.zeros((B * V, C, out_h, out_w), device=device, dtype=dtype)
+
+        for face_id in range(6):
+            grid = grids[face_id].unsqueeze(0).repeat(B * V, 1, 1, 1)
+            sampled = F.grid_sample(
+                face_values[:, face_id],
+                grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=True,
+            )
+            mask = masks[face_id].view(1, 1, out_h, out_w)
+            out = out + sampled * mask
+
+        return out.reshape(B, V, C, out_h, out_w).permute(0, 1, 3, 4, 2).contiguous()
+
+    def _rasterize_erp_via_cubemap(
+        self,
+        means,
+        quats,
+        scales,
+        opacities,
+        colors,
+        viewmats,
+        Ks,
+        width,
+        height,
+        **kwargs,
+    ):
+        B, V = viewmats.shape[:2]
+        face_size = self._get_face_size(height)
+
+        face_viewmats, face_Ks = self._build_cubemap_cameras(viewmats, face_size)
+        face_colors, face_depths, face_alphas = self.rasterizer.rasterize_batches(
+            means,
+            quats,
+            scales,
+            opacities,
+            colors,
+            face_viewmats,
+            face_Ks,
+            width=face_size,
+            height=face_size,
+            camera_model="pinhole",
+            **kwargs,
+        )
+
+        face_colors = face_colors.reshape(B, V, 6, face_size, face_size, -1)
+        face_depths = face_depths.reshape(B, V, 6, face_size, face_size, -1)
+        face_alphas = face_alphas.reshape(B, V, 6, face_size, face_size, -1)
+
+        # Convert cubemap pinhole z-depth to ray-distance depth before ERP reprojection.
+        face_coords = (
+            torch.arange(face_size, device=face_depths.device, dtype=face_depths.dtype)
+            + 0.5
+            - (float(face_size) - 1.0) * 0.5
+        ) / (float(face_size) * 0.5)
+        face_v, face_u = torch.meshgrid(face_coords, face_coords, indexing="ij")
+        depth_scale = torch.sqrt(face_u.square() + face_v.square() + 1.0).view(1, 1, 1, face_size, face_size, 1)
+        face_depths = face_depths * depth_scale
+
+        rendered_colors = self._cubemap_faces_to_erp(face_colors, out_h=height, out_w=width)
+        rendered_depths = self._cubemap_faces_to_erp(face_depths, out_h=height, out_w=width)
+        rendered_alphas = self._cubemap_faces_to_erp(face_alphas, out_h=height, out_w=width)
+        return rendered_colors, rendered_depths, rendered_alphas
+
+    def rasterize_batches(self, means, quats, scales, opacities, colors, viewmats, Ks, width, height, **kwargs):
+        use_cubemap = self._should_use_erp_cubemap(height=height, width=width, Ks=Ks)
+        if use_cubemap:
+            return self._rasterize_erp_via_cubemap(
+                means,
+                quats,
+                scales,
+                opacities,
+                colors,
+                viewmats,
+                Ks,
+                width=width,
+                height=height,
+                **kwargs,
+            )
+        return self.rasterizer.rasterize_batches(
+            means,
+            quats,
+            scales,
+            opacities,
+            colors,
+            viewmats,
+            Ks,
+            width,
+            height,
+            **kwargs,
+        )
 
     # ======== Main entry point: Complete GS rendering and fill results back to predictions ========
     def render(
@@ -221,7 +455,7 @@ class GaussianSplatRenderer(nn.Module):
             viewmats_i = render_viewmats[:, i:end_idx]
             Ks_i = render_Ks[:, i:end_idx]
 
-            rendered_colors, rendered_depths, rendered_alphas = self.rasterizer.rasterize_batches(
+            rendered_colors, rendered_depths, rendered_alphas = self.rasterize_batches(
                 splats["means"], splats["quats"], splats["scales"], splats["opacities"],
                 splats["sh"] if "sh" in splats else splats["colors"],
                 viewmats_i.detach(), Ks_i.detach(),

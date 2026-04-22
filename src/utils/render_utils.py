@@ -249,14 +249,14 @@ def render_interpolated_video(gs_renderer: GaussianSplatRenderer,
                 effects_splats["scales"] = effects_splats["scales"].log()
                 effects_splats["opacities"] = torch.logit(torch.clamp(effects_splats["opacities"], 1e-6, 1 - 1e-6))
                 gs_renderer.rasterizer.runner.splats = effects_splats
-                colors, depths, _ = gs_renderer.rasterizer.rasterize_batches(
+                colors, depths, _ = gs_renderer.rasterize_batches(
                 None, None, None, 
                 None, None,
                 add_ext[:, st:ed].to(torch.float32), add_int[:, st:ed].to(torch.float32),
                 width=w, height=h, sh_degree=gs_renderer.sh_degree,
                 )
             except:
-                colors, depths, _ = gs_renderer.rasterizer.rasterize_batches(
+                colors, depths, _ = gs_renderer.rasterize_batches(
                 effects_splats["means"][None], effects_splats["quats"][None], effects_splats["scales"][None], 
                 effects_splats["opacities"][None], effects_splats["sh"][None],
                 add_ext[:, st:ed].to(torch.float32), add_int[:, st:ed].to(torch.float32),
@@ -300,14 +300,14 @@ def render_interpolated_video(gs_renderer: GaussianSplatRenderer,
                 effects_splats["scales"] = effects_splats["scales"].log()
                 effects_splats["opacities"] = torch.logit(torch.clamp(effects_splats["opacities"], 1e-6, 1 - 1e-6))
                 gs_renderer.rasterizer.runner.splats = effects_splats
-                colors, depths, _ = gs_renderer.rasterizer.rasterize_batches(
+                colors, depths, _ = gs_renderer.rasterize_batches(
                 None, None, None, 
                 None, None,
                 all_ext[:, st:ed].to(torch.float32), all_int[:, st:ed].to(torch.float32),
                 width=w, height=h, sh_degree=gs_renderer.sh_degree,
                 )
             except:
-                colors, depths, _ = gs_renderer.rasterizer.rasterize_batches(
+                colors, depths, _ = gs_renderer.rasterize_batches(
                 effects_splats["means"][None], effects_splats["quats"][None], effects_splats["scales"][None], 
                 effects_splats["opacities"][None], effects_splats["sh"][None],
                 all_ext[:, st:ed].to(torch.float32), all_int[:, st:ed].to(torch.float32),
@@ -319,7 +319,7 @@ def render_interpolated_video(gs_renderer: GaussianSplatRenderer,
                 loop_dir *= -1
                 t = t_ed if loop_dir == -1 else t
         else:
-            colors, depths, _ = gs_renderer.rasterizer.rasterize_batches(
+            colors, depths, _ = gs_renderer.rasterize_batches(
                 splats["means"][:1], splats["quats"][:1], splats["scales"][:1], splats["opacities"][:1],
                 splats["sh"][:1] if "sh" in splats else splats["colors"][:1],
                 all_ext[:, st:ed].to(torch.float32), all_int[:, st:ed].to(torch.float32),

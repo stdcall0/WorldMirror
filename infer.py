@@ -22,10 +22,70 @@ from src.utils.render_utils import render_interpolated_video
 
 from src.utils.build_pycolmap_recon import build_pycolmap_reconstruction
 from src.models.utils.camera_utils import vector_to_camera_matrices
+from src.utils.pose_io import load_pose_sequence
 
 # Import mask computation utilities
 from src.utils.geometry import depth_edge, normals_edge
 from src.utils.visual_util import segment_sky, download_file_from_url
+
+
+def _load_state_dict_from_file(ckpt_path: str):
+    """Load a raw state dict from checkpoint/safetensors file."""
+    suffix = Path(ckpt_path).suffix.lower()
+    if suffix == ".safetensors":
+        try:
+            from safetensors.torch import load_file as load_safetensors
+        except Exception as exc:
+            raise ImportError(
+                "Loading .safetensors requires safetensors package"
+            ) from exc
+        state_dict = load_safetensors(ckpt_path, device="cpu")
+    else:
+        payload = torch.load(ckpt_path, map_location="cpu")
+        if isinstance(payload, dict) and "state_dict" in payload and isinstance(payload["state_dict"], dict):
+            state_dict = payload["state_dict"]
+        elif isinstance(payload, dict):
+            state_dict = payload
+        else:
+            raise ValueError(f"Unsupported checkpoint payload type: {type(payload)}")
+
+    if not isinstance(state_dict, dict):
+        raise ValueError("Checkpoint does not contain a valid state dict")
+    return state_dict
+
+
+def _load_weights_from_checkpoint(model: torch.nn.Module, ckpt_path: str) -> None:
+    """Partially load checkpoint weights into model (shape-safe, prefix-safe)."""
+    if not os.path.isfile(ckpt_path):
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
+    raw_state = _load_state_dict_from_file(ckpt_path)
+    current_state = model.state_dict()
+
+    matched = 0
+    skipped_missing = 0
+    skipped_shape = 0
+
+    for key, value in raw_state.items():
+        if not torch.is_tensor(value):
+            continue
+
+        mapped_key = key[6:] if key.startswith("model.") else key
+        if mapped_key not in current_state:
+            skipped_missing += 1
+            continue
+        if current_state[mapped_key].shape != value.shape:
+            skipped_shape += 1
+            continue
+
+        current_state[mapped_key] = value
+        matched += 1
+
+    model.load_state_dict(current_state, strict=False)
+    print(
+        f"✅ Loaded checkpoint weights from {ckpt_path}: "
+        f"matched={matched}, skipped_missing={skipped_missing}, skipped_shape={skipped_shape}"
+    )
 
 
 def create_filter_mask(
@@ -115,45 +175,67 @@ def main():
     parser = argparse.ArgumentParser(description="HunyuanWorld-Mirror inference")
     parser.add_argument("--input_path", type=str, default="examples/realistic/Ireland_Landscape", help="Input can be: a directory of images; a single video file; or a directory containing multiple video files (.mp4/.avi/.mov/.webm/.gif). If directory has multiple videos, frames from all clips are extracted (using --fps) and merged in filename order.")
     parser.add_argument("--output_path", type=str, default="inference_output")
+    parser.add_argument("--ckpt_path", type=str, default=None, help="Optional local checkpoint (.ckpt/.pt/.pth/.safetensors) to override model weights")
     parser.add_argument("--fps", type=int, default=1, help="Frames per second for video extraction")
     parser.add_argument("--target_size", type=int, default=518, help="Target size for image resizing")
+    parser.add_argument("--resize_strategy", type=str, default="erp", choices=["erp", "crop", "pad"], help="Input resize strategy")
+    parser.add_argument("--circular_pad_pixels", type=int, default=0, help="Horizontal circular padding pixels for ERP boundary compensation")
+    parser.add_argument("--pose_file", type=str, default=None, help="Optional external pose file (.json/.txt/.csv)")
+    parser.add_argument("--pose_format", type=str, default="c2w", choices=["c2w", "w2c"], help="Pose convention of external pose file")
+    parser.add_argument("--two_pass", action="store_true", help="Run two-pass inference when no external poses are provided")
     parser.add_argument("--write_txt", action="store_true", help="Also write human-readable COLMAP txt (slow, huge)")
     # Mask filtering parameters
     parser.add_argument("--confidence_percentile", type=float, default=10.0, help="Confidence percentile threshold for filtering (0-100, filters bottom X percent)")
     parser.add_argument("--edge_normal_threshold", type=float, default=5.0, help="Normal angle threshold in degrees for edge detection")
     parser.add_argument("--edge_depth_threshold", type=float, default=0.03, help="Relative depth threshold for edge detection")
-    parser.add_argument("--apply_confidence_mask", action="store_true", default=True, help="Apply confidence-based filtering")
-    parser.add_argument("--apply_edge_mask", action="store_true", default=True, help="Apply edge-based filtering")
-    parser.add_argument("--apply_sky_mask", action="store_true", default=False, help="Apply sky mask filtering")
+    parser.add_argument("--apply_confidence_mask", action=argparse.BooleanOptionalAction, default=True, help="Apply confidence-based filtering")
+    parser.add_argument("--apply_edge_mask", action=argparse.BooleanOptionalAction, default=True, help="Apply edge-based filtering")
+    parser.add_argument("--apply_sky_mask", action=argparse.BooleanOptionalAction, default=False, help="Apply sky mask filtering")
     # Save flags
-    parser.add_argument("--save_pointmap", action="store_true", default=True, help="Save points PLY")
-    parser.add_argument("--save_depth", action="store_true", default=True, help="Save depth PNG")
-    parser.add_argument("--save_normal", action="store_true", default=True, help="Save normal PNG")
-    parser.add_argument("--save_gs", action="store_true", default=True, help="Save Gaussians PLY")
-    parser.add_argument("--save_rendered", action="store_true", default=True, help="Save rendered video")
-    parser.add_argument("--save_colmap", action="store_true", default=True, help="Save COLMAP sparse")
+    parser.add_argument("--save_pointmap", action=argparse.BooleanOptionalAction, default=True, help="Save points PLY")
+    parser.add_argument("--save_depth", action=argparse.BooleanOptionalAction, default=True, help="Save depth PNG")
+    parser.add_argument("--save_normal", action=argparse.BooleanOptionalAction, default=True, help="Save normal PNG")
+    parser.add_argument("--save_gs", action=argparse.BooleanOptionalAction, default=True, help="Save Gaussians PLY")
+    parser.add_argument("--save_rendered", action=argparse.BooleanOptionalAction, default=True, help="Save rendered video")
+    parser.add_argument("--save_colmap", action=argparse.BooleanOptionalAction, default=True, help="Save COLMAP sparse")
     # Conditioning flags
     parser.add_argument("--cond_pose", action="store_true", help="Use camera pose conditioning if available")
-    parser.add_argument("--cond_intrinsics", action="store_true", help="Use intrinsics conditioning if available")
     parser.add_argument("--cond_depth", action="store_true", help="Use depth conditioning if available")
+    parser.add_argument("--cond_raymap", action=argparse.BooleanOptionalAction, default=True, help="Enable dense raymap conditioning")
+    parser.add_argument("--disable_ray_conditioning", action="store_true", help="Deprecated alias for --no-cond-raymap")
+    parser.add_argument("--cond_intrinsics", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
+
+    # Backward compatibility for older CLI flags.
+    if args.disable_ray_conditioning:
+        args.cond_raymap = False
+    if args.cond_intrinsics:
+        args.cond_raymap = True
 
     # Print inference parameters
     print(f"🔧 Configuration:")
     print(f"  - FPS: {args.fps}")
     print(f"  - Target size: {args.target_size}px")
+    print(f"  - Resize strategy: {args.resize_strategy}")
+    print(f"  - Circular pad pixels: {args.circular_pad_pixels}")
+    print(f"  - Checkpoint override: {args.ckpt_path if args.ckpt_path else 'None'}")
+    print(f"  - Pose file: {args.pose_file if args.pose_file else 'None'}")
+    print(f"  - Pose format: {args.pose_format}")
+    print(f"  - Two-pass inference: {'✅' if args.two_pass else '❌'}")
     print(f"  - Mask Filtering:")
     print(f"    - Confidence mask: {'✅' if args.apply_confidence_mask else '❌'} (percentile: {args.confidence_percentile}%)")
     print(f"    - Edge mask: {'✅' if args.apply_edge_mask else '❌'} (normal: {args.edge_normal_threshold}°, depth: {args.edge_depth_threshold})")
     print(f"    - Sky mask: {'✅' if args.apply_sky_mask else '❌'}")
     print(f"  - Conditioning:")
     print(f"    - Pose: {'✅' if args.cond_pose else '❌'}")
-    print(f"    - Intrinsics: {'✅' if args.cond_intrinsics else '❌'}")
     print(f"    - Depth: {'✅' if args.cond_depth else '❌'}")
+    print(f"    - Dense Raymap: {'✅' if args.cond_raymap else '❌'}")
 
     # 1) Init model - This requires internet access or the huggingface hub cache to be pre-downloaded
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = WorldMirror.from_pretrained("tencent/HunyuanWorld-Mirror").to(device)
+    if args.ckpt_path:
+        _load_weights_from_checkpoint(model, args.ckpt_path)
     model.eval()
     
     input_path = Path(args.input_path)
@@ -201,10 +283,26 @@ def main():
 
     # 3) Load and preprocess images
     views = {}
-    imgs = prepare_images_to_tensor(img_paths, target_size=args.target_size, resize_strategy="crop").to(device)  # [1,S,3,H,W], in [0,1]
+    imgs = prepare_images_to_tensor(
+        img_paths,
+        target_size=args.target_size,
+        resize_strategy=args.resize_strategy,
+        circular_pad_pixels=args.circular_pad_pixels,
+    ).to(device)  # [1,S,3,H,W], in [0,1]
     views["img"] = imgs
     B, S, C, H, W = imgs.shape
-    cond_flags = [0, 0, 0]
+    cond_flags = [int(args.cond_pose), int(args.cond_depth), int(args.cond_raymap)]
+
+    if args.pose_file is not None:
+        loaded_poses = load_pose_sequence(args.pose_file, pose_format=args.pose_format)
+        if loaded_poses.shape[0] != S:
+            raise ValueError(
+                f"Pose count mismatch: image count={S}, pose count={loaded_poses.shape[0]}"
+            )
+        views["camera_poses"] = loaded_poses.unsqueeze(0).to(device)
+        cond_flags[0] = 1
+        print(f"📍 Loaded {S} external poses from {args.pose_file}")
+
     print(f"📸 Loaded {S} images with shape {imgs.shape}")
 
     # 4) Inference
@@ -216,6 +314,17 @@ def main():
     else:
         amp_dtype = torch.float32
     with torch.no_grad():
+        if args.two_pass and "camera_poses" not in views:
+            print("🔁 Running pass-1 to estimate camera poses...")
+            first_pass_flags = [0, int(args.cond_depth), cond_flags[2]]
+            with torch.amp.autocast('cuda', enabled=bool(use_amp), dtype=amp_dtype):
+                first_pass = model(views={"img": views["img"]}, cond_flags=first_pass_flags)
+            if "camera_poses" not in first_pass:
+                raise RuntimeError("Pass-1 failed to produce camera_poses")
+            views["camera_poses"] = first_pass["camera_poses"].detach()
+            cond_flags[0] = 1
+            print("🔁 Running pass-2 with world-space pose conditioning...")
+
         with torch.amp.autocast('cuda', enabled=bool(use_amp), dtype=amp_dtype):
             predictions = model(views=views, cond_flags=cond_flags)  # Multi-modal inference with priors
     print(f"🕒 Inference time: {time.time() - start_time:.3f} seconds")
@@ -339,25 +448,26 @@ def main():
             save_normal_png(normal_dir / f"normal_{i:04d}.png", predictions["normals"][0, i])
         print(f"  - Saved {S} normal maps to {normal_dir}")
 
-    # Save Gaussians PLY and render video
-    if "splats" in predictions and args.save_gs:
+    # Save Gaussians PLY and/or render video
+    if "splats" in predictions and (args.save_gs or args.save_rendered):
         # Get Gaussian parameters (already filtered by GaussianSplatRenderer)
         means = predictions["splats"]["means"][0].reshape(-1, 3)
         scales = predictions["splats"]["scales"][0].reshape(-1, 3)
         quats = predictions["splats"]["quats"][0].reshape(-1, 4)
         colors = (predictions["splats"]["sh"][0] if "sh" in predictions["splats"] else predictions["splats"]["colors"][0]).reshape(-1, 3)
         opacities = predictions["splats"]["opacities"][0].reshape(-1)
-        
-        # Save Gaussian PLY
-        ply_path = outdir / "gaussians.ply"
-        save_gs_ply(
-            ply_path,
-            means,
-            scales,
-            quats,
-            colors,
-            opacities,
-        )
+
+        if args.save_gs:
+            # Save Gaussian PLY
+            ply_path = outdir / "gaussians.ply"
+            save_gs_ply(
+                ply_path,
+                means,
+                scales,
+                quats,
+                colors,
+                opacities,
+            )
 
         # Render video using the same filtered splats from predictions
         num_views = S
@@ -366,7 +476,7 @@ def main():
             k3x3 = predictions['camera_intrs']
             render_interpolated_video(model.gs_renderer, predictions["splats"], e4x4, k3x3, (H, W), outdir / "rendered", interp_per_pair=15, loop_reverse=num_views==1)
             print(f"  - Saved rendered.mp4 to {outdir}")
-        else:
+        elif args.save_gs:
             print(f"⚠️  Not set --save_rendered flag, skipping video rendering")
 
     # Build and export COLMAP reconstruction (images + sparse)
@@ -397,8 +507,13 @@ def main():
             )  # [S, H, W]
         
         # Prepare extrinsics/intrinsics (camera-from-world) using resized image size
-        e3x4, intr = vector_to_camera_matrices(predictions["camera_params"], image_hw=(final_height, final_width))
-        _, intr_resize = vector_to_camera_matrices(predictions["camera_params"], image_hw=(H, W))
+        camera_model = getattr(model, "camera_model", "spherical")
+        e3x4, intr = vector_to_camera_matrices(
+            predictions["camera_params"], image_hw=(final_height, final_width), camera_model=camera_model
+        )
+        _, intr_resize = vector_to_camera_matrices(
+            predictions["camera_params"], image_hw=(H, W), camera_model=camera_model
+        )
         extrinsics = e3x4[0] # [S,3,4]
         intrinsics = intr[0] # [S,3,3]
         intrinsics_resize = intr_resize[0] # [S,3,3]
@@ -456,6 +571,12 @@ def main():
         # Build reconstruction using pycolmap (PINHOLE) with resized image size
         # Standard COLMAP reconstruction with 2D-3D correspondences
         image_size = np.array([final_width, final_height])
+        colmap_camera_model = "SIMPLE_PINHOLE"
+        if str(camera_model).lower() in {"spherical", "erp"}:
+            print(
+                "⚠️  COLMAP export uses SIMPLE_PINHOLE approximation for ERP cameras. "
+                "This is for interoperability and may not preserve exact spherical geometry."
+            )
         reconstruction = build_pycolmap_reconstruction(
             points=f_pts,
             pixel_coords=f_xyf,
@@ -464,7 +585,7 @@ def main():
             intrinsics=intrinsics,
             image_size=image_size,
             shared_camera_model=False,
-            camera_model="SIMPLE_PINHOLE",
+            camera_model=colmap_camera_model,
         )
 
         # Update image names to match saved files

@@ -28,6 +28,13 @@ class WorldMirrorDataModule(LightningDataModule):
         num_pixels_range: list[int] | None = None,
         decay: float = 0.5,
         allview_p: float = 0.2,
+        enable_fov_curriculum: bool = False,
+        fov_start_deg: float = 90.0,
+        fov_end_deg: float = 360.0,
+        fov_curriculum_total_steps: int | None = None,
+        enable_circular_pad_after_fov_unlock: bool = False,
+        circular_pad_pixels_after_fov_unlock: int = 0,
+        circular_pad_prob_after_fov_unlock: float = 0.5,
         transform=ImageAugmentation(apply_aug=False),
     ) -> None:
         """Initialize a WorldMirrorDataModule.
@@ -43,6 +50,13 @@ class WorldMirrorDataModule(LightningDataModule):
         :param num_pixels_range: Range of pixel counts [min, max] for dynamic resolution.
         :param decay: Decay factor for dynamic batch sampling strategy.
         :param allview_p: Probability of using all available views in a sample.
+        :param enable_fov_curriculum: Enable continuous FoV curriculum sampling.
+        :param fov_start_deg: Initial FoV in degrees for curriculum.
+        :param fov_end_deg: Final FoV in degrees for curriculum.
+        :param fov_curriculum_total_steps: Steps to reach final FoV.
+        :param enable_circular_pad_after_fov_unlock: Enable ERP circular padding after FoV curriculum is fully unlocked.
+        :param circular_pad_pixels_after_fov_unlock: Horizontal circular padding pixels in the above stage.
+        :param circular_pad_prob_after_fov_unlock: Probability to apply circular padding per sampled batch after unlock.
         :param transform: Transform to apply to the data.
         """
         super().__init__()
@@ -58,6 +72,13 @@ class WorldMirrorDataModule(LightningDataModule):
         self.num_pixels_range = num_pixels_range
         self.decay = decay
         self.allview_p = allview_p
+        self.enable_fov_curriculum = enable_fov_curriculum
+        self.fov_start_deg = fov_start_deg
+        self.fov_end_deg = fov_end_deg
+        self.fov_curriculum_total_steps = fov_curriculum_total_steps
+        self.enable_circular_pad_after_fov_unlock = enable_circular_pad_after_fov_unlock
+        self.circular_pad_pixels_after_fov_unlock = circular_pad_pixels_after_fov_unlock
+        self.circular_pad_prob_after_fov_unlock = circular_pad_prob_after_fov_unlock
         self.transform = transform
         
         # Placeholder for training dataloader, initialized in train_dataloader()
@@ -99,6 +120,13 @@ class WorldMirrorDataModule(LightningDataModule):
             num_pixels_range=self.num_pixels_range,
             decay=self.decay,
             allview_p=self.allview_p,
+            enable_fov_curriculum=self.enable_fov_curriculum,
+            fov_start_deg=self.fov_start_deg,
+            fov_end_deg=self.fov_end_deg,
+            fov_curriculum_total_steps=self.fov_curriculum_total_steps,
+            enable_circular_pad_after_fov_unlock=self.enable_circular_pad_after_fov_unlock,
+            circular_pad_pixels_after_fov_unlock=self.circular_pad_pixels_after_fov_unlock,
+            circular_pad_prob_after_fov_unlock=self.circular_pad_prob_after_fov_unlock,
         )
 
         # Create the training dataloader with dynamic batching

@@ -2,7 +2,9 @@ _target_: training.wrapper.WorldMirrorWrapper
 
 pretrained: null
 resume: ${ckpt_path} # if ckpt_path is not None, resume training from checkpoint and ignore the pretrained weights
-enable_cond: false
+enable_cond: true
+cond_sampling_strategy: custom
+cond_sampling_probs: [0.5, 0.5, 1.0]
 
 model:
   _target_: src.models.models.worldmirror.WorldMirror
@@ -10,6 +12,11 @@ model:
   patch_size: 14
   embed_dim: 1024
   gs_dim: 256
+  camera_model: spherical
+  gs_erp_render_mode: auto
+  gs_cubemap_face_size: null
+  gs_cubemap_face_scale: 1.0
+  gs_erp_aspect_threshold: 1.8
   enable_cam: true
   enable_pts: true
   enable_depth: true
@@ -32,7 +39,7 @@ optimizer:
       lr: 2e-4
       weight_decay: 0.1
   pretrained_params: ['visual_geometry_transformer.patch_embed']
-  new_params: ['normal_head', 'gs_head', 'gs_renderer', 'depth_embed', 'rays_embed', 'camera_embed']
+  new_params: ['norm_head', 'gs_head', 'gs_renderer', 'depth_embed', 'ray_embed', 'pose_embed']
 
 scheduler:
   type: WarmupCosineAnnealingLR
@@ -50,6 +57,7 @@ train_criterion:
   enable_gs: ${wrapper.model.enable_gs}
   losses:
     - _target_: training.losses.camera.CameraLoss
+      camera_model: ${wrapper.model.camera_model}
     - _target_: training.losses.point.PointLoss
       gamma: 1.0
       alpha: 0.2

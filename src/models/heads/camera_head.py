@@ -23,6 +23,7 @@ class CameraHead(nn.Module):
         trans_act: str = "linear",
         quat_act: str = "linear",
         fl_act: str = "relu",
+        camera_model: str = "spherical",
     ):
         super().__init__()
 
@@ -30,6 +31,7 @@ class CameraHead(nn.Module):
         self.trans_act = trans_act
         self.quat_act = quat_act
         self.fl_act = fl_act
+        self.camera_model = camera_model
         self.depth = trunk_depth
 
         # Build refinement network using transformer block sequence
@@ -115,13 +117,17 @@ class CameraHead(nn.Module):
         """
         trans_vec = params[..., :3]
         quat_vec = params[..., 3:7]
-        fl_vec = params[..., 7:]  # or field of view
+        tail_vec = params[..., 7:]
 
         trans_vec = self.apply_parameter_activation(trans_vec, self.trans_act)
         quat_vec = self.apply_parameter_activation(quat_vec, self.quat_act)
-        fl_vec = self.apply_parameter_activation(fl_vec, self.fl_act)
+        if self.camera_model == "spherical":
+            # Spherical camera mode uses normalized ERP center offsets in [-1, 1].
+            tail_vec = torch.tanh(tail_vec)
+        else:
+            tail_vec = self.apply_parameter_activation(tail_vec, self.fl_act)
 
-        activated_params = torch.cat([trans_vec, quat_vec, fl_vec], dim=-1)
+        activated_params = torch.cat([trans_vec, quat_vec, tail_vec], dim=-1)
         return activated_params
 
     def apply_parameter_activation(self, tensor: torch.Tensor, act_type: str) -> torch.Tensor:

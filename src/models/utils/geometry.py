@@ -2,6 +2,68 @@ import torch
 import numpy as np
 
 
+def _is_spherical_intrinsics(camera_intrinsics: torch.Tensor, height: int, width: int, rel_tol: float = 0.05) -> torch.Tensor:
+    """Detect ERP pseudo intrinsics from focal lengths."""
+    fx = camera_intrinsics[:, 0, 0]
+    fy = camera_intrinsics[:, 1, 1]
+
+    expected_fx = float(width) / (2.0 * np.pi)
+    expected_fy = float(height) / np.pi
+    tol_fx = max(expected_fx * rel_tol, 1e-6)
+    tol_fy = max(expected_fy * rel_tol, 1e-6)
+
+    full_erp = ((fx - expected_fx).abs() <= tol_fx) & ((fy - expected_fy).abs() <= tol_fy)
+    # Allow horizontal FoV-cropped ERP intrinsics: fy follows ERP rule while fx can be larger.
+    partial_erp = ((fy - expected_fy).abs() <= tol_fy) & (fx >= (expected_fx - tol_fx))
+    valid = torch.isfinite(fx) & torch.isfinite(fy) & (fx > 1e-6) & (fy > 1e-6)
+
+    return valid & (full_erp | partial_erp)
+
+
+def _depth_to_camera_coords_pinhole(
+    depthmap: torch.Tensor,
+    camera_intrinsics: torch.Tensor,
+    u_grid: torch.Tensor,
+    v_grid: torch.Tensor,
+) -> torch.Tensor:
+    bsz = depthmap.shape[0]
+    fx = camera_intrinsics[:, 0, 0]
+    fy = camera_intrinsics[:, 1, 1]
+    cx = camera_intrinsics[:, 0, 2]
+    cy = camera_intrinsics[:, 1, 2]
+
+    z_cam = depthmap
+    x_cam = (u_grid - cx.view(bsz, 1, 1)) * z_cam / fx.view(bsz, 1, 1)
+    y_cam = (v_grid - cy.view(bsz, 1, 1)) * z_cam / fy.view(bsz, 1, 1)
+    return torch.stack([x_cam, y_cam, z_cam], dim=-1)
+
+
+def _depth_to_camera_coords_spherical(
+    depthmap: torch.Tensor,
+    camera_intrinsics: torch.Tensor,
+    u_grid: torch.Tensor,
+    v_grid: torch.Tensor,
+) -> torch.Tensor:
+    bsz = depthmap.shape[0]
+    fx = camera_intrinsics[:, 0, 0]
+    fy = camera_intrinsics[:, 1, 1]
+    cx = camera_intrinsics[:, 0, 2]
+    cy = camera_intrinsics[:, 1, 2]
+
+    u_center = u_grid + 0.5
+    v_center = v_grid + 0.5
+    lon = (u_center - cx.view(bsz, 1, 1)) / fx.view(bsz, 1, 1)
+    lat = 0.5 * np.pi - (v_center - cy.view(bsz, 1, 1)) / fy.view(bsz, 1, 1)
+
+    cos_lat = torch.cos(lat)
+    dir_x = cos_lat * torch.sin(lon)
+    dir_y = -torch.sin(lat)
+    dir_z = cos_lat * torch.cos(lon)
+    dirs = torch.stack([dir_x, dir_y, dir_z], dim=-1)
+
+    return dirs * depthmap[..., None]
+
+
 def depth_to_camera_coords(depthmap, camera_intrinsics):
     """
     Convert depth map to 3D camera coordinates.
@@ -21,12 +83,6 @@ def depth_to_camera_coords(depthmap, camera_intrinsics):
     # Ensure intrinsics are float
     camera_intrinsics = camera_intrinsics.float()
     
-    # Extract focal lengths and principal points
-    fx = camera_intrinsics[:, 0, 0]  # (B,)
-    fy = camera_intrinsics[:, 1, 1]  # (B,)
-    cx = camera_intrinsics[:, 0, 2]  # (B,)
-    cy = camera_intrinsics[:, 1, 2]  # (B,)
-    
     # Generate pixel grid
     v_grid, u_grid = torch.meshgrid(
         torch.arange(H, dtype=dtype, device=device),
@@ -37,17 +93,17 @@ def depth_to_camera_coords(depthmap, camera_intrinsics):
     # Reshape for broadcasting: (1, H, W)
     u_grid = u_grid.unsqueeze(0)
     v_grid = v_grid.unsqueeze(0)
-    
-    # Compute 3D camera coordinates
-    # X = (u - cx) * Z / fx
-    # Y = (v - cy) * Z / fy
-    # Z = depth
-    z_cam = depthmap  # (B, H, W)
-    x_cam = (u_grid - cx.view(B, 1, 1)) * z_cam / fx.view(B, 1, 1)
-    y_cam = (v_grid - cy.view(B, 1, 1)) * z_cam / fy.view(B, 1, 1)
-    
-    # Stack to form (B, H, W, 3)
-    X_cam = torch.stack([x_cam, y_cam, z_cam], dim=-1)
+
+    is_spherical = _is_spherical_intrinsics(camera_intrinsics, H, W)
+    if bool(is_spherical.all()):
+        X_cam = _depth_to_camera_coords_spherical(depthmap, camera_intrinsics, u_grid, v_grid)
+    elif bool((~is_spherical).all()):
+        X_cam = _depth_to_camera_coords_pinhole(depthmap, camera_intrinsics, u_grid, v_grid)
+    else:
+        cam_pinhole = _depth_to_camera_coords_pinhole(depthmap, camera_intrinsics, u_grid, v_grid)
+        cam_spherical = _depth_to_camera_coords_spherical(depthmap, camera_intrinsics, u_grid, v_grid)
+        spherical_mask = is_spherical.view(B, 1, 1, 1)
+        X_cam = torch.where(spherical_mask, cam_spherical, cam_pinhole)
     
     # Valid depth mask
     valid_mask = depthmap > 0.0
